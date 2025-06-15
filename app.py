@@ -1,34 +1,25 @@
 from flask import Flask, render_template, request, jsonify
-from flask_socketio import SocketIO, emit
-from agent import Agent
-from tools import TimeTool, WeatherTool, CalculatorTool
+from flask_socketio import SocketIO
+from agent import AIAgent
 import os
-from dotenv import load_dotenv
 from datetime import datetime
 import json
-from collections import defaultdict
-
-# Load environment variables
-load_dotenv()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Initialize agent
-agent = Agent()
-agent.add_tool(TimeTool())
-agent.add_tool(WeatherTool())
-agent.add_tool(CalculatorTool())
-
-# Analytics storage
+# Initialize analytics data
 analytics = {
     'total_messages': 0,
-    'tool_usage': defaultdict(int),
-    'conversation_history': [],
-    'active_users': set(),
-    'response_times': []
+    'active_users': 0,
+    'average_response_time': 0,
+    'tool_usage': {},
+    'recent_conversations': []
 }
+
+# Initialize AI Agent
+agent = AIAgent()
 
 @app.route('/')
 def index():
@@ -40,90 +31,61 @@ def dashboard():
 
 @app.route('/api/analytics')
 def get_analytics():
-    return jsonify({
-        'total_messages': analytics['total_messages'],
-        'tool_usage': dict(analytics['tool_usage']),
-        'active_users': len(analytics['active_users']),
-        'average_response_time': sum(analytics['response_times']) / len(analytics['response_times']) if analytics['response_times'] else 0,
-        'recent_conversations': analytics['conversation_history'][-10:]  # Last 10 conversations
-    })
-
-@socketio.on('send_message')
-def handle_message(data):
-    user_message = data.get('message', '')
-    user_id = request.sid
-    
-    if not user_message:
-        return
-    
-    # Update analytics
-    analytics['total_messages'] += 1
-    analytics['active_users'].add(user_id)
-    start_time = datetime.now()
-    
-    # Process the message using our agent
-    response = agent.process_input(user_message)
-    
-    # Calculate response time
-    response_time = (datetime.now() - start_time).total_seconds()
-    analytics['response_times'].append(response_time)
-    
-    # Track tool usage
-    tool = agent._should_use_tool(user_message)
-    if tool:
-        analytics['tool_usage'][tool.name()] += 1
-    
-    # Store conversation
-    conversation = {
-        'timestamp': datetime.now().isoformat(),
-        'user_message': user_message,
-        'assistant_response': response,
-        'tool_used': tool.name() if tool else None,
-        'response_time': response_time
-    }
-    analytics['conversation_history'].append(conversation)
-    
-    # Emit the response back to the client
-    emit('receive_message', {
-        'message': response,
-        'type': 'assistant',
-        'tool_used': tool.name() if tool else None,
-        'response_time': response_time
-    })
-    
-    # Broadcast analytics update to dashboard
-    emit('analytics_update', {
-        'total_messages': analytics['total_messages'],
-        'tool_usage': dict(analytics['tool_usage']),
-        'active_users': len(analytics['active_users']),
-        'average_response_time': sum(analytics['response_times']) / len(analytics['response_times']) if analytics['response_times'] else 0
-    }, broadcast=True)
+    return jsonify(analytics)
 
 @socketio.on('connect')
 def handle_connect():
-    user_id = request.sid
-    analytics['active_users'].add(user_id)
-    
-    # Send welcome message
-    emit('receive_message', {
-        'message': "Hello! I'm your AI assistant. How can I help you today?",
-        'type': 'assistant'
-    })
-    
-    # Broadcast user count update
-    emit('analytics_update', {
-        'active_users': len(analytics['active_users'])
-    }, broadcast=True)
+    analytics['active_users'] += 1
+    socketio.emit('analytics_update', analytics)
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    user_id = request.sid
-    analytics['active_users'].discard(user_id)
+    analytics['active_users'] = max(0, analytics['active_users'] - 1)
+    socketio.emit('analytics_update', analytics)
+
+@socketio.on('message')
+def handle_message(data):
+    start_time = datetime.now()
     
-    # Broadcast user count update
-    emit('analytics_update', {
-        'active_users': len(analytics['active_users'])
-    }, broadcast=True)
+    # Get user message
+    user_message = data.get('message', '')
+    
+    # Process message with AI agent
+    response = agent.process_message(user_message)
+    
+    # Calculate response time
+    end_time = datetime.now()
+    response_time = (end_time - start_time).total_seconds()
+    
+    # Update analytics
+    analytics['total_messages'] += 1
+    analytics['average_response_time'] = (
+        (analytics['average_response_time'] * (analytics['total_messages'] - 1) + response_time)
+        / analytics['total_messages']
+    )
+    
+    # Update tool usage
+    tool_used = response.get('tool_used', 'None')
+    analytics['tool_usage'][tool_used] = analytics['tool_usage'].get(tool_used, 0) + 1
+    
+    # Add to recent conversations
+    conversation = {
+        'timestamp': datetime.now().isoformat(),
+        'user_message': user_message,
+        'assistant_response': response.get('response', ''),
+        'tool_used': tool_used,
+        'response_time': response_time
+    }
+    analytics['recent_conversations'].insert(0, conversation)
+    analytics['recent_conversations'] = analytics['recent_conversations'][:10]  # Keep only last 10
+    
+    # Emit response and analytics update
+    socketio.emit('response', response)
+    socketio.emit('analytics_update', analytics)
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True) 
+    # For local development
+    socketio.run(app, debug=True)
+else:
+    # For Vercel deployment
+    app = app 
